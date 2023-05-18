@@ -117,7 +117,7 @@ void FlatIndex::query(
         Tensor<idx_t, 2, true>& outIndices,
         bool exactDistance) {
     auto stream = resources_->getDefaultStreamCurrentDevice();
-
+    std::cout << "FlatIndex::query useFloat16_=" << useFloat16_ << std::endl;
     if (useFloat16_) {
         // We need to convert the input to float16 for comparison to ourselves
         auto inputHalf = convertTensorTemporary<float, half, 2>(
@@ -157,6 +157,7 @@ void FlatIndex::query(
         Tensor<float, 2, true>& outDistances,
         Tensor<idx_t, 2, true>& outIndices,
         bool exactDistance) {
+    std::cout << "FlatIndex::query useFloat16_=" << useFloat16_ << std::endl;
     FAISS_ASSERT(useFloat16_);
 
     bfKnnOnDevice(
