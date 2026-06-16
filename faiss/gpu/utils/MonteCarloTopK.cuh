@@ -10,6 +10,8 @@
 #include <faiss/gpu/GpuResources.h>
 #include <faiss/gpu/utils/DeviceTensor.cuh>
 
+#include <cstdint>
+
 namespace faiss {
 namespace gpu {
 
@@ -22,8 +24,11 @@ namespace gpu {
 /// the threshold is the `sampleK`-th largest sample score and candidates satisfy
 /// score >= threshold.
 ///
-/// If a row has fewer than k candidates or more than `candidateCap` candidates,
-/// the row falls back to exact top-k over `scores`.
+/// By default, if a row has fewer than k candidates or more than
+/// `candidateCap` candidates, the row falls back to exact top-k over `scores`.
+/// If `overflowCutoff` is true, overflow rows keep a pseudo-random subset of
+/// `candidateCap` candidates and do not fall back. Underflow rows still fall
+/// back because they cannot produce k valid outputs.
 void runMonteCarloTopKFromScores(
         GpuResources* res,
         cudaStream_t stream,
@@ -35,7 +40,9 @@ void runMonteCarloTopKFromScores(
         bool dir,
         Tensor<float, 2, true>& outDistances,
         Tensor<idx_t, 2, true>& outIndices,
-        Tensor<int, 1, true>* outCounts = nullptr);
+        Tensor<int, 1, true>* outCounts = nullptr,
+        bool overflowCutoff = false,
+        uint64_t cutoffSeed = 0);
 
 } // namespace gpu
 } // namespace faiss

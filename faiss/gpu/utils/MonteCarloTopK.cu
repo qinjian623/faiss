@@ -44,6 +44,15 @@ __device__ __forceinline__ bool mcBetter(
     }
 }
 
+__device__ __forceinline__ uint32_t mcHash32(uint32_t x) {
+    x ^= x >> 16;
+    x *= 0x7feb352du;
+    x ^= x >> 15;
+    x *= 0x846ca68bu;
+    x ^= x >> 16;
+    return x;
+}
+
 __global__ void mcFilterKernel(
         Tensor<float, 2, true> scores,
         Tensor<float, 2, true> thresholdValues,
@@ -51,7 +60,9 @@ __global__ void mcFilterKernel(
         Tensor<float, 2, true> candidateValues,
         Tensor<idx_t, 2, true> candidateIndices,
         Tensor<int, 1, true> counts,
-        bool dir) {
+        bool dir,
+        bool overflowCutoff,
+        uint64_t cutoffSeed) {
     auto row = idx_t(blockIdx.y);
     auto col = idx_t(blockIdx.x) * blockDim.x + threadIdx.x;
 
@@ -68,6 +79,16 @@ __global__ void mcFilterKernel(
         if (pos < candidateValues.getSize(1)) {
             candidateValues[row][pos] = value;
             candidateIndices[row][pos] = col;
+        } else if (overflowCutoff) {
+            uint32_t h = mcHash32(
+                    uint32_t(col) ^ (uint32_t(row) * 0x9e3779b9u) ^
+                    (uint32_t(pos) * 0x85ebca6bu) ^
+                    uint32_t(cutoffSeed) ^ uint32_t(cutoffSeed >> 32));
+            int slot = int(h % uint32_t(pos + 1));
+            if (slot < candidateValues.getSize(1)) {
+                candidateValues[row][slot] = value;
+                candidateIndices[row][slot] = col;
+            }
         }
     }
 }
@@ -120,6 +141,7 @@ __global__ void mcFallbackExactTopKKernel(
         int candidateCap,
         int k,
         bool dir,
+        bool overflowCutoff,
         Tensor<float, 2, true> outDistances,
         Tensor<idx_t, 2, true> outIndices) {
     extern __shared__ unsigned char shared[];
@@ -131,7 +153,7 @@ __global__ void mcFallbackExactTopKKernel(
     int tid = threadIdx.x;
     int count = counts[row];
 
-    if (count >= k && count <= candidateCap) {
+    if (count >= k && (overflowCutoff || count <= candidateCap)) {
         return;
     }
 
@@ -196,7 +218,9 @@ void runMonteCarloTopKFromScores(
         bool dir,
         Tensor<float, 2, true>& outDistances,
         Tensor<idx_t, 2, true>& outIndices,
-        Tensor<int, 1, true>* outCounts) {
+        Tensor<int, 1, true>* outCounts,
+        bool overflowCutoff,
+        uint64_t cutoffSeed) {
     auto rows = scores.getSize(0);
     auto cols = scores.getSize(1);
 
@@ -252,7 +276,9 @@ void runMonteCarloTopKFromScores(
             candidateValues,
             candidateIndices,
             counts,
-            dir);
+            dir,
+            overflowCutoff,
+            cutoffSeed);
 
     dim3 candidateBlocks(
             utils::divUp(idx_t(candidateCap), idx_t(kFilterThreads)),
@@ -282,7 +308,14 @@ void runMonteCarloTopKFromScores(
             kFallbackThreads,
             sharedBytes,
             stream>>>(
-            scores, counts, candidateCap, k, dir, outDistances, outIndices);
+            scores,
+            counts,
+            candidateCap,
+            k,
+            dir,
+            overflowCutoff,
+            outDistances,
+            outIndices);
 
     if (outCounts) {
         outCounts->copyFrom(counts, stream);

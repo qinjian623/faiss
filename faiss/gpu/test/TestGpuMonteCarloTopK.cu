@@ -139,6 +139,68 @@ TEST(TestGpuMonteCarloTopK, minFallbackWhenCandidateCapOverflows) {
     runCase(false, {0.0f, 128.0f, 255.0f}, 3, 8);
 }
 
+TEST(TestGpuMonteCarloTopK, minCutoffWhenCandidateCapOverflows) {
+    using namespace faiss;
+    using namespace faiss::gpu;
+
+    constexpr int rows = 1;
+    constexpr int cols = 4096;
+    constexpr int k = 5;
+
+    StandardGpuResources res;
+    auto resources = res.getResources().get();
+    auto stream = resources->getDefaultStreamCurrentDevice();
+
+    HostTensor<float, 2, true> hostScores({rows, cols});
+    for (int col = 0; col < cols; ++col) {
+        hostScores[0][col] = static_cast<float>(col);
+    }
+
+    HostTensor<float, 2, true> hostSampleScores({rows, 1});
+    hostSampleScores[0][0] = static_cast<float>(cols);
+
+    DeviceTensor<float, 2, true> gpuScores(
+            resources, makeDevAlloc(AllocType::Other, 0), hostScores);
+    DeviceTensor<float, 2, true> gpuSampleScores(
+            resources, makeDevAlloc(AllocType::Other, 0), hostSampleScores);
+    DeviceTensor<float, 2, true> gpuOutDistances(
+            resources, makeDevAlloc(AllocType::Other, 0), {rows, k});
+    DeviceTensor<idx_t, 2, true> gpuOutIndices(
+            resources, makeDevAlloc(AllocType::Other, 0), {rows, k});
+    DeviceTensor<int, 1, true> gpuCounts(
+            resources, makeDevAlloc(AllocType::Other, 0), {rows});
+
+    runMonteCarloTopKFromScores(
+            resources,
+            stream,
+            gpuScores,
+            gpuSampleScores,
+            1,
+            k,
+            k,
+            false,
+            gpuOutDistances,
+            gpuOutIndices,
+            &gpuCounts,
+            true,
+            123);
+
+    HostTensor<idx_t, 2, true> outIndices(gpuOutIndices, stream);
+    HostTensor<int, 1, true> counts(gpuCounts, stream);
+
+    EXPECT_EQ(counts[0], cols);
+
+    int exactHits = 0;
+    for (int i = 0; i < k; ++i) {
+        EXPECT_GE(outIndices[0][i], 0);
+        EXPECT_LT(outIndices[0][i], cols);
+        if (outIndices[0][i] < k) {
+            ++exactHits;
+        }
+    }
+    EXPECT_LT(exactHits, k);
+}
+
 TEST(TestGpuMonteCarloTopK, maxCandidatePath) {
     runCase(true, {256.0f, 255.0f, 220.0f, 0.0f}, 3, 64);
 }

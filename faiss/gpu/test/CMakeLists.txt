@@ -56,6 +56,17 @@ if(FAISS_ENABLE_CUVS)
   faiss_gpu_test(TestGpuIndexCagra.cu)
 endif()
 
+add_executable(bench_gpu_monte_carlo_topk EXCLUDE_FROM_ALL
+  BenchGpuMonteCarloTopK.${GPU_EXT_PREFIX})
+target_link_libraries(bench_gpu_monte_carlo_topk PRIVATE faiss_gpu_test_helper)
+
+if(NOT FAISS_ENABLE_ROCM)
+  add_executable(bench_gpu_sift1m_monte_carlo_topk EXCLUDE_FROM_ALL
+    BenchGpuSift1MMonteCarloTopK.cu)
+  target_link_libraries(bench_gpu_sift1m_monte_carlo_topk PRIVATE
+    faiss_gpu_test_helper CUDA::cublas)
+endif()
+
 add_executable(demo_ivfpq_indexing_gpu EXCLUDE_FROM_ALL
   demo_ivfpq_indexing_gpu.cpp)
 
