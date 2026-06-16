@@ -56,6 +56,7 @@ set(FAISS_GPU_SRC
   impl/IcmEncoder.cu
   utils/BlockSelectFloat.cu
   utils/DeviceUtils.cu
+  utils/MonteCarloTopK.cu
   utils/StackDeviceMemory.cpp
   utils/Timer.cpp
   utils/WarpSelectFloat.cu
@@ -149,6 +150,7 @@ set(FAISS_GPU_HEADERS
   utils/MergeNetworkBlock.cuh
   utils/MergeNetworkUtils.cuh
   utils/MergeNetworkWarp.cuh
+  utils/MonteCarloTopK.cuh
   utils/NoTypeTensor.cuh
   utils/Pair.cuh
   utils/PtxUtils.cuh
