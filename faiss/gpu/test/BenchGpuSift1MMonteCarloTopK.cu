@@ -15,6 +15,7 @@
 #include <faiss/gpu/utils/StaticUtils.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <fstream>
@@ -66,15 +67,26 @@ struct RunStats {
     double mcSelectionS = 0.0;
     double recallVsExactSum = 0.0;
     double recallVsExactMin = 1.0;
+    double scoreValidSum = 0.0;
+    double scoreValidMin = 1.0;
+    double tieAwareSum = 0.0;
+    double tieAwareMin = 1.0;
     double exactGtSum = 0.0;
     double mcGtSum = 0.0;
     int qualityRows = 0;
     long long candidateSum = 0;
     int candidateMin = 0;
     int candidateMax = 0;
+    long long boundaryTieSum = 0;
+    int boundaryTieMax = 0;
+    int boundaryTieRows = 0;
     int fallbacks = 0;
     int underflows = 0;
     int overflows = 0;
+    std::vector<int> candidateCounts;
+    std::vector<double> exactTotalBatchS;
+    std::vector<double> mcTotalBatchS;
+    std::vector<double> mcSelectionBatchS;
 };
 
 [[noreturn]] void fail(const std::string& msg) {
@@ -245,6 +257,41 @@ __global__ void repeatScoresKernel(
     out[row][col] = in[row][col % in.getSize(1)].data()[0];
 }
 
+__global__ void boundaryTieCountKernel(
+        faiss::gpu::Tensor<float, 2, true> scores,
+        faiss::gpu::Tensor<float, 2, true> exactDistances,
+        faiss::gpu::Tensor<int, 1, true> tieCounts,
+        int k,
+        float eps) {
+    auto row = faiss::idx_t(blockIdx.x);
+    if (row >= scores.getSize(0)) {
+        return;
+    }
+
+    __shared__ float boundary;
+    if (threadIdx.x == 0) {
+        float b = exactDistances[row][0].data()[0];
+        for (int i = 1; i < k; ++i) {
+            b = fmaxf(b, exactDistances[row][i].data()[0]);
+        }
+        boundary = b;
+        tieCounts[row] = 0;
+    }
+    __syncthreads();
+
+    int local = 0;
+    for (auto col = faiss::idx_t(threadIdx.x); col < scores.getSize(1);
+         col += blockDim.x) {
+        float v = scores[row][col].data()[0];
+        if (fabsf(v - boundary) <= eps) {
+            ++local;
+        }
+    }
+    if (local > 0) {
+        atomicAdd(tieCounts[row].data(), local);
+    }
+}
+
 template <typename Fn>
 float timeOnce(cudaStream_t stream, Fn fn) {
     cudaEvent_t start;
@@ -345,6 +392,44 @@ double overlapBetween(
     return double(hit) / double(k);
 }
 
+double rowMax(const float* values, int k) {
+    float out = values[0];
+    for (int i = 1; i < k; ++i) {
+        out = std::max(out, values[i]);
+    }
+    return double(out);
+}
+
+double tieAwareScoreValidity(
+        const float* mcDistances,
+        int k,
+        double exactBoundary,
+        double eps) {
+    int valid = 0;
+    for (int i = 0; i < k; ++i) {
+        if (double(mcDistances[i]) <= exactBoundary + eps) {
+            ++valid;
+        }
+    }
+    return double(valid) / double(k);
+}
+
+template <typename T>
+double percentile(std::vector<T> values, double p) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    double pos = (p / 100.0) * double(values.size() - 1);
+    size_t lo = static_cast<size_t>(std::floor(pos));
+    size_t hi = static_cast<size_t>(std::ceil(pos));
+    if (lo == hi) {
+        return double(values[lo]);
+    }
+    double w = pos - double(lo);
+    return double(values[lo]) * (1.0 - w) + double(values[hi]) * w;
+}
+
 Args parseArgs(int argc, char** argv) {
     Args args;
     for (int i = 1; i < argc; ++i) {
@@ -433,23 +518,28 @@ RunStats runOnce(
             resources, makeDevAlloc(AllocType::Other, 0), {args.batchSize, args.k});
     DeviceTensor<int, 1, true> counts(
             resources, makeDevAlloc(AllocType::Other, 0), {args.batchSize});
+    DeviceTensor<int, 1, true> boundaryTieCounts(
+            resources, makeDevAlloc(AllocType::Other, 0), {args.batchSize});
 
     for (int start = 0; start < queryCount; start += args.batchSize) {
         DeviceTensor<float, 2, true> queryBatch(
                 queries.data() + size_t(start) * queries.getSize(1),
                 {args.batchSize, queries.getSize(1)});
 
-        stats.sampleDistanceS += timeOnce(stream, [&] {
+        double sampleDistanceS = timeOnce(stream, [&] {
             computeScores(handle, stream, queryBatch, samples, sampleNorms, sampleScores);
         });
+        stats.sampleDistanceS += sampleDistanceS;
 
-        stats.distanceS += timeOnce(stream, [&] {
+        double distanceS = timeOnce(stream, [&] {
             computeScores(handle, stream, queryBatch, base, baseNorms, scores);
         });
+        stats.distanceS += distanceS;
 
         Tensor<float, 2, true>* selectScores = &scores;
+        double scoreRepeatS = 0.0;
         if (args.baseRepeat > 1) {
-            stats.scoreRepeatS += timeOnce(stream, [&] {
+            scoreRepeatS = timeOnce(stream, [&] {
                 constexpr int threads = 256;
                 dim3 blocks(
                         utils::divUp(
@@ -459,10 +549,11 @@ RunStats runOnce(
                 repeatScoresKernel<<<blocks, threads, 0, stream>>>(
                         scores, repeatedScores);
             });
+            stats.scoreRepeatS += scoreRepeatS;
             selectScores = &repeatedScores;
         }
 
-        stats.exactSelectionS += timeOnce(stream, [&] {
+        double exactSelectionS = timeOnce(stream, [&] {
             runBlockSelect(
                     *selectScores,
                     exactDistances,
@@ -471,8 +562,9 @@ RunStats runOnce(
                     args.k,
                     stream);
         });
+        stats.exactSelectionS += exactSelectionS;
 
-        stats.mcSelectionS += timeOnce(stream, [&] {
+        double mcSelectionS = timeOnce(stream, [&] {
             runMonteCarloTopKFromScores(
                     resources,
                     stream,
@@ -488,11 +580,33 @@ RunStats runOnce(
                     args.overflowCutoff,
                     args.cutoffSeed);
         });
+        stats.mcSelectionS += mcSelectionS;
+        stats.exactTotalBatchS.push_back(
+                distanceS + scoreRepeatS + exactSelectionS);
+        stats.mcTotalBatchS.push_back(
+                sampleDistanceS + distanceS + scoreRepeatS + mcSelectionS);
+        stats.mcSelectionBatchS.push_back(mcSelectionS);
 
         if (collectQuality) {
+            constexpr int threads = 256;
+            boundaryTieCountKernel<<<
+                    static_cast<unsigned int>(args.batchSize),
+                    threads,
+                    0,
+                    stream>>>(
+                    *selectScores,
+                    exactDistances,
+                    boundaryTieCounts,
+                    args.k,
+                    1e-5f);
+
             HostTensor<idx_t, 2, true> exactHost(exactIndices, stream);
             HostTensor<idx_t, 2, true> mcHost(mcIndices, stream);
+            HostTensor<float, 2, true> exactDistanceHost(
+                    exactDistances, stream);
+            HostTensor<float, 2, true> mcDistanceHost(mcDistances, stream);
             HostTensor<int, 1, true> countHost(counts, stream);
+            HostTensor<int, 1, true> tieHost(boundaryTieCounts, stream);
 
             for (int row = 0; row < args.batchSize; ++row) {
                 double recallVsExact = overlapBetween(
@@ -503,6 +617,21 @@ RunStats runOnce(
                 stats.recallVsExactSum += recallVsExact;
                 stats.recallVsExactMin =
                         std::min(stats.recallVsExactMin, recallVsExact);
+                double exactBoundary =
+                        rowMax(exactDistanceHost[row].data(), args.k);
+                double mcBoundary = rowMax(mcDistanceHost[row].data(), args.k);
+                double scoreValid =
+                        mcBoundary <= exactBoundary + 1e-5 ? 1.0 : 0.0;
+                stats.scoreValidSum += scoreValid;
+                stats.scoreValidMin =
+                        std::min(stats.scoreValidMin, scoreValid);
+                double tieAware = tieAwareScoreValidity(
+                        mcDistanceHost[row].data(),
+                        args.k,
+                        exactBoundary,
+                        1e-5);
+                stats.tieAwareSum += tieAware;
+                stats.tieAwareMin = std::min(stats.tieAwareMin, tieAware);
                 stats.exactGtSum += overlapAtK(
                         exactHost[row].data(),
                         gt.data.data() + size_t(start + row) * gt.dim,
@@ -520,6 +649,14 @@ RunStats runOnce(
                 stats.candidateSum += count;
                 stats.candidateMin = std::min(stats.candidateMin, count);
                 stats.candidateMax = std::max(stats.candidateMax, count);
+                stats.candidateCounts.push_back(count);
+                int boundaryTies = tieHost.data()[row];
+                stats.boundaryTieSum += boundaryTies;
+                stats.boundaryTieMax =
+                        std::max(stats.boundaryTieMax, boundaryTies);
+                if (boundaryTies > 1) {
+                    ++stats.boundaryTieRows;
+                }
                 if (count < args.k) {
                     ++stats.underflows;
                 }
@@ -688,12 +825,28 @@ int main(int argc, char** argv) {
             std::cout << " recall_vs_exact="
                       << stats.recallVsExactSum / stats.qualityRows
                       << " recall_vs_exact_min=" << stats.recallVsExactMin
+                      << " score_valid_mean="
+                      << stats.scoreValidSum / stats.qualityRows
+                      << " score_valid_min=" << stats.scoreValidMin
+                      << " tie_aware_mean="
+                      << stats.tieAwareSum / stats.qualityRows
+                      << " tie_aware_min=" << stats.tieAwareMin
                       << " exact_gt=" << stats.exactGtSum / stats.qualityRows
                       << " mc_gt=" << stats.mcGtSum / stats.qualityRows
                       << " candidate_mean="
                       << double(stats.candidateSum) / stats.qualityRows
+                      << " candidate_p50="
+                      << percentile(stats.candidateCounts, 50.0)
+                      << " candidate_p95="
+                      << percentile(stats.candidateCounts, 95.0)
+                      << " candidate_p99="
+                      << percentile(stats.candidateCounts, 99.0)
                       << " candidate_min=" << stats.candidateMin
                       << " candidate_max=" << stats.candidateMax
+                      << " boundary_tie_mean="
+                      << double(stats.boundaryTieSum) / stats.qualityRows
+                      << " boundary_tie_rows=" << stats.boundaryTieRows
+                      << " boundary_tie_max=" << stats.boundaryTieMax
                       << " underflows=" << stats.underflows
                       << " overflows=" << stats.overflows
                       << " fallbacks=" << stats.fallbacks;
@@ -738,12 +891,38 @@ int main(int argc, char** argv) {
               << " physical_estimate_speedup=" << exactPhysical / mcPhysical
               << " recall_vs_exact=" << last.recallVsExactSum / last.qualityRows
               << " recall_vs_exact_min=" << last.recallVsExactMin
+              << " score_valid_mean=" << last.scoreValidSum / last.qualityRows
+              << " score_valid_min=" << last.scoreValidMin
+              << " tie_aware_mean=" << last.tieAwareSum / last.qualityRows
+              << " tie_aware_min=" << last.tieAwareMin
               << " exact_gt=" << last.exactGtSum / last.qualityRows
               << " mc_gt=" << last.mcGtSum / last.qualityRows
               << " candidate_mean="
               << double(last.candidateSum) / last.qualityRows
+              << " candidate_p50=" << percentile(last.candidateCounts, 50.0)
+              << " candidate_p95=" << percentile(last.candidateCounts, 95.0)
+              << " candidate_p99=" << percentile(last.candidateCounts, 99.0)
               << " candidate_min=" << last.candidateMin
               << " candidate_max=" << last.candidateMax
+              << " boundary_tie_mean="
+              << double(last.boundaryTieSum) / last.qualityRows
+              << " boundary_tie_rows=" << last.boundaryTieRows
+              << " boundary_tie_max=" << last.boundaryTieMax
+              << " exact_batch_p50_s="
+              << percentile(last.exactTotalBatchS, 50.0)
+              << " exact_batch_p95_s="
+              << percentile(last.exactTotalBatchS, 95.0)
+              << " exact_batch_p99_s="
+              << percentile(last.exactTotalBatchS, 99.0)
+              << " mc_batch_p50_s=" << percentile(last.mcTotalBatchS, 50.0)
+              << " mc_batch_p95_s=" << percentile(last.mcTotalBatchS, 95.0)
+              << " mc_batch_p99_s=" << percentile(last.mcTotalBatchS, 99.0)
+              << " mc_select_batch_p50_s="
+              << percentile(last.mcSelectionBatchS, 50.0)
+              << " mc_select_batch_p95_s="
+              << percentile(last.mcSelectionBatchS, 95.0)
+              << " mc_select_batch_p99_s="
+              << percentile(last.mcSelectionBatchS, 99.0)
               << " underflows=" << last.underflows
               << " overflows=" << last.overflows
               << " fallbacks=" << last.fallbacks << std::endl;
